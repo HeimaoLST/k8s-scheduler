@@ -2,28 +2,33 @@ package main
 
 import (
 	"errors"
+	"sort"
 )
 
 type Pod struct {
-	Name     string
-	CPU      int
-	Memory   int
-	GPU      int
-	Priority int
+	Name      string
+	CPU       int
+	Memory    int
+	GPU       int
+	TPURequst int
+	Priority  int
 }
-
+type TPU struct {
+	ID        int
+	NUMANode  int
+	Allocated bool
+}
 type Node struct {
 	Name           string
 	CPUCapacity    int
 	MemoryCapacity int
 	GPUCapacity    int
-
-	CPUUsed    int
-	MemoryUsed int
-	GPUUsed    int
+	TPUs           []TPU
+	CPUUsed        int
+	MemoryUsed     int
+	GPUUsed        int
 }
 
-// NodeResourcesAvailable is the result of the PreFilter resource calculation.
 type NodeResourcesAvailable struct {
 	CPU    int
 	Memory int
@@ -36,6 +41,7 @@ type PodResources struct {
 	CPU    int
 	Memory int
 	GPU    int
+	TPU    int
 }
 
 func availableResources(node Node) NodeResourcesAvailable {
@@ -56,24 +62,28 @@ type ScorePlugin interface {
 	Score(pod Pod, node Node, status *CycleState) int
 }
 
-// Scheduler runs PreFilter, Filter, Score, and SelectNode in that order.
+type WeightScorePlugin struct {
+	ScorePlugin
+	Weight int
+}
 type Scheduler struct {
 	prefilters []PreFilterPlugin
 	filters    []FilterPlugin
-	scorers    []ScorePlugin
+	scorers    []WeightScorePlugin
 }
 
-func NewScheduler(perfilters []PreFilterPlugin, filters []FilterPlugin, scorers []ScorePlugin) *Scheduler {
+func NewScheduler(perfilters []PreFilterPlugin, filters []FilterPlugin, scorers []WeightScorePlugin) *Scheduler {
 	return &Scheduler{prefilters: perfilters, filters: filters, scorers: scorers}
 }
 
-// Schedule is the minimal scheduler requested by the exercise. It uses the
-// default plugins; the score calculation itself remains inside ScorePlugin.
 func Schedule(pod Pod, nodes []Node) (string, error) {
 	return NewScheduler(
 		[]PreFilterPlugin{FooPreFilter{}},
-		[]FilterPlugin{ResourceFitFilter{}},
-		[]ScorePlugin{CPUAndGPUPackingScore{weight: 10}},
+		[]FilterPlugin{ResourceFitFilter{}, TPUFitFilter{}},
+		[]WeightScorePlugin{
+			{CPUAndGPUPackingScore{}, 1},
+			{TPUTopologyScore{}, 10},
+		},
 	).Schedule(pod, nodes)
 }
 
@@ -152,6 +162,7 @@ func (FooPreFilter) PreFilter(pod Pod, status *CycleState) error {
 		pod.CPU,
 		pod.Memory,
 		pod.GPU,
+		pod.TPURequst,
 	}
 	return nil
 }
@@ -165,6 +176,13 @@ func (ResourceFitFilter) Filter(pod Pod, node Node, status *CycleState) bool {
 	return available.CPU >= podrequest.CPU &&
 		available.Memory >= podrequest.Memory &&
 		available.GPU >= podrequest.GPU
+}
+
+type TPUFitFilter struct{}
+
+func (TPUFitFilter) Filter(pod Pod, node Node, status *CycleState) bool {
+	needTPU := status.podrequest.TPU
+	return caculateTPUAvailable(node) >= needTPU
 }
 
 type CPUAndGPUPackingScore struct {
@@ -182,9 +200,52 @@ func (s CPUAndGPUPackingScore) Score(pod Pod, node Node, status *CycleState) int
 	return (cpuScore + gpuPackingScore) * s.weight
 }
 
+type TPUTopologyScore struct{}
+
+func (TPUTopologyScore) Score(pod Pod, node Node, status *CycleState) int {
+	if status.podrequest.TPU == 0 {
+		return 0
+	}
+	tpuNUMAMap := make(map[int]int)
+	for _, tpu := range node.TPUs {
+		if !tpu.Allocated {
+			tpuNUMAMap[tpu.NUMANode]++
+		}
+	}
+	list := make([]int, 0)
+	for _, v := range tpuNUMAMap {
+		list = append(list, v)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i] > list[j]
+	})
+	groups := 0
+	sum := 0
+	for i := range list {
+		sum += list[i]
+		groups++
+		if sum >= status.podrequest.TPU {
+			break
+		}
+	}
+	return 100 - (groups - 1)
+}
+
 func percentage(value, capacity int) int {
 	if capacity <= 0 {
 		return 0
 	}
 	return value * 100 / capacity
+}
+
+func caculateTPUAvailable(node Node) int {
+	cnt := 0
+	tpus := node.TPUs
+
+	for _, tpu := range tpus {
+		if !tpu.Allocated {
+			cnt++
+		}
+	}
+	return cnt
 }
