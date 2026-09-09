@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"sort"
+	"sync"
 )
 
 type Pod struct {
@@ -43,15 +44,6 @@ type PodResources struct {
 	GPU    int
 	TPU    int
 }
-
-func availableResources(node Node) NodeResourcesAvailable {
-	return NodeResourcesAvailable{
-		CPU:    node.CPUCapacity - node.CPUUsed,
-		Memory: node.MemoryCapacity - node.MemoryUsed,
-		GPU:    node.GPUCapacity - node.GPUUsed,
-	}
-}
-
 type PreFilterPlugin interface {
 	PreFilter(pod Pod, status *CycleState) error
 }
@@ -67,36 +59,61 @@ type WeightScorePlugin struct {
 	Weight int
 }
 type Scheduler struct {
+	cache      *SchedulerCache
+	snapshot   *SchedulerSnapshot
 	prefilters []PreFilterPlugin
 	filters    []FilterPlugin
 	scorers    []WeightScorePlugin
 }
 
-func NewScheduler(perfilters []PreFilterPlugin, filters []FilterPlugin, scorers []WeightScorePlugin) *Scheduler {
-	return &Scheduler{prefilters: perfilters, filters: filters, scorers: scorers}
+type SchedulerCache struct {
+	nodes map[string]Node
+	rwL   *sync.RWMutex
+}
+type SchedulerSnapshot struct {
+	nodes map[string]Node
+}
+
+func NewScheduler(cache *SchedulerCache, perfilters []PreFilterPlugin, filters []FilterPlugin, scorers []WeightScorePlugin) *Scheduler {
+	return &Scheduler{cache: cache, snapshot: &SchedulerSnapshot{}, prefilters: perfilters, filters: filters, scorers: scorers}
 }
 
 func Schedule(pod Pod, nodes []Node) (string, error) {
+	nodeMap := make(map[string]Node, 0)
+	for _, node := range nodes {
+		nodeMap[node.Name] = node
+	}
 	return NewScheduler(
+		&SchedulerCache{nodeMap, &sync.RWMutex{}},
 		[]PreFilterPlugin{FooPreFilter{}},
 		[]FilterPlugin{ResourceFitFilter{}, TPUFitFilter{}},
 		[]WeightScorePlugin{
 			{CPUAndGPUPackingScore{}, 1},
 			{TPUTopologyScore{}, 10},
 		},
-	).Schedule(pod, nodes)
+	).Schedule(pod)
 }
 
-func (s *Scheduler) Schedule(pod Pod, nodes []Node) (string, error) {
+func (s *Scheduler) updateSnapshot() {
+	s.cache.rwL.RLock()
+	defer s.cache.rwL.RUnlock()
+	s.snapshot.nodes = s.cache.nodes
+}
+
+func (s *Scheduler) Schedule(pod Pod) (string, error) {
 	if pod.CPU < 0 || pod.Memory < 0 || pod.GPU < 0 {
 		return "", errors.New("pod resource requests must not be negative")
 	}
+	s.updateSnapshot()
 	status := &CycleState{}
 	err := s.doPreFilters(pod, status)
 	if err != nil {
 		return "", errors.Join(errors.New("prefilter faild: "), err)
 	}
-
+	nodes := make([]Node, 0)
+	for _, node := range s.snapshot.nodes {
+		nodes = append(nodes, node)
+	}
 	feasible := make([]Node, 0, len(nodes))
 	for _, node := range nodes {
 		if s.passesFilters(pod, node, status) {
@@ -248,4 +265,12 @@ func caculateTPUAvailable(node Node) int {
 		}
 	}
 	return cnt
+}
+
+func availableResources(node Node) NodeResourcesAvailable {
+	return NodeResourcesAvailable{
+		CPU:    node.CPUCapacity - node.CPUUsed,
+		Memory: node.MemoryCapacity - node.MemoryUsed,
+		GPU:    node.GPUCapacity - node.GPUUsed,
+	}
 }
